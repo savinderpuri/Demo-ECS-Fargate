@@ -1,0 +1,183 @@
+name: Build and Deploy to ECS
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - '.github/workflows/**'
+      - 'pom.xml'
+      - 'src/**'
+      - 'Dockerfile'
+  pull_request:
+    branches: [main, master]
+    paths:
+      - '.github/workflows/**'
+      - 'pom.xml'
+      - 'src/**'
+      - 'Dockerfile'
+  workflow_dispatch:
+    inputs:
+      skip_deploy:
+        description: 'Skip ECS deployment'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: devops-demo
+  ECS_CLUSTER: devops-demo-cluster
+  ECS_SERVICE: devops-demo
+  APP_VERSION: ${{ github.sha }}
+
+jobs:
+  build:
+    name: Build WAR
+    runs-on: self-hosted
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Set version
+        id: version
+        run: |
+          VERSION=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)
+          SHORT_SHA=${GITHUB_SHA::7}
+          echo "version=${VERSION}-${SHORT_SHA}" >> $GITHUB_OUTPUT
+          echo "Building version: ${VERSION}-${SHORT_SHA}"
+
+      - name: Build with Maven
+        run: mvn clean package -DskipTests
+
+      - name: Upload WAR artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: war-artifact
+          path: target/*.war
+          retention-days: 5
+
+  # Optional: Push to Nexus
+  push-to-nexus:
+    name: Push to Nexus
+    runs-on: self-hosted
+    needs: build
+    if: vars.NEXUS_URL != ''
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Deploy to Nexus
+        env:
+          NEXUS_URL: ${{ vars.NEXUS_URL }}
+          NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+        run: |
+          mvn deploy -DskipTests \
+            -DaltDeploymentRepository=nexus::default::${NEXUS_URL}/repository/maven-releases \
+            -s .github/maven-settings.xml
+
+  docker-build-push:
+    name: Build & Push Docker Image
+    runs-on: self-hosted
+    needs: build
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tags }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download WAR artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: war-artifact
+          path: target/
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        run: |
+          aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
+
+      - name: Set image metadata
+        id: meta
+        run: |
+          IMAGE_TAG=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:${{ needs.build.outputs.version }}
+          echo "tags=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          echo "Image tag: ${IMAGE_TAG}"
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            --build-arg APP_VERSION=${{ needs.build.outputs.version }} \
+            -t ${{ steps.meta.outputs.tags }} \
+            -t ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:latest \
+            .
+
+      - name: Push to ECR
+        run: |
+          docker push ${{ steps.meta.outputs.tags }}
+          docker push ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:latest
+
+  deploy-to-ecs:
+    name: Deploy to ECS Fargate
+    runs-on: self-hosted
+    needs: [build, docker-build-push]
+    if: github.event_name != 'pull_request' && inputs.skip_deploy != true
+    steps:
+      - name: Update ECS service
+        run: |
+          echo "Deploying to ECS Fargate..."
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.ECS_SERVICE }} \
+            --force-new-deployment \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Wait for deployment
+        run: |
+          echo "Waiting for deployment to stabilize..."
+          aws ecs wait services-stable \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.ECS_SERVICE }} \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Get service public IP
+        id: get-ip
+        run: |
+          TASK_ARN=$(aws ecs list-tasks --cluster ${{ env.ECS_CLUSTER }} --service-name ${{ env.ECS_SERVICE }} --query 'taskArns[0]' --output text --region ${{ env.AWS_REGION }})
+          ENI_ID=$(aws ecs describe-tasks --cluster ${{ env.ECS_CLUSTER }} --tasks $TASK_ARN --query 'tasks[0].attachments[0].details[?name==`networkInterfaceId`].value' --output text --region ${{ env.AWS_REGION }})
+          PUBLIC_IP=$(aws ec2 describe-network-interfaces --network-interface-ids $ENI_ID --query 'NetworkInterfaces[0].Association.PublicIp' --output text --region ${{ env.AWS_REGION }})
+          echo "public_ip=${PUBLIC_IP}" >> $GITHUB_OUTPUT
+          echo "Service available at: http://${PUBLIC_IP}:8080"
+
+      - name: Verify deployment
+        run: |
+          echo "Verifying deployment health..."
+          sleep 30  # Wait for container to start
+          PUBLIC_IP=${{ steps.get-ip.outputs.public_ip }}
+          curl -f http://${PUBLIC_IP}:8080/api/health || echo "Health check pending..."
+          echo ""
+          echo "================================================"
+          echo "Deployment Complete!"
+          echo "Application URL: http://${PUBLIC_IP}:8080"
+          echo "Health Check:    http://${PUBLIC_IP}:8080/api/health"
+          echo "API Info:        http://${PUBLIC_IP}:8080/api/info"
+          echo "================================================"
