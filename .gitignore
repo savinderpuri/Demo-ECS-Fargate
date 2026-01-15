@@ -9,7 +9,7 @@ target/
 .settings/
 *.swp
 *.swo
-*~
+.vscode/
 
 # OS files
 .DS_Store
@@ -17,7 +17,6 @@ Thumbs.db
 
 # Logs
 *.log
-logs/
 
 # Environment files
 .env
