@@ -25,14 +25,14 @@ on:
 
 env:
   AWS_REGION: us-east-1
-  ECR_REPOSITORY: devops-demo
-  ECS_CLUSTER: devops-demo-cluster
-  ECS_SERVICE: devops-demo
+  ECR_REPOSITORY: demo-ecs-fargate
+  ECS_CLUSTER: demo-ecs-fargate-cluster
+  ECS_SERVICE: demo-ecs-fargate-service
 
 jobs:
   build-and-deploy:
     name: Build, Push & Deploy
-    runs-on: self-hosted-1629bd96
+    runs-on: self-hosted-e9f947d6
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
