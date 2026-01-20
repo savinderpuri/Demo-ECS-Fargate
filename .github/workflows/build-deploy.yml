@@ -32,7 +32,7 @@ env:
 jobs:
   build-and-deploy:
     name: Build, Push & Deploy
-    runs-on: self-hosted-75596623
+    runs-on: self-hosted-b118e906
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -112,7 +112,6 @@ jobs:
       - name: Wait for deployment
         if: github.event_name != 'pull_request' && inputs.skip_deploy != true
         run: |
-          aws ecs wait services-stable \
             --cluster ${{ env.ECS_CLUSTER }} \
             --services ${{ env.ECS_SERVICE }} \
             --region ${{ env.AWS_REGION }}
