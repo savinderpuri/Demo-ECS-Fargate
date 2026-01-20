@@ -102,7 +102,7 @@ jobs:
         if: github.event_name != 'pull_request' && inputs.skip_deploy != true
         run: |
           echo "Deploying to ECS Fargate..."
-          aws ecs update-service \ --no-wait
+          aws ecs update-service \
             --cluster ${{ env.ECS_CLUSTER }} \
             --service ${{ env.ECS_SERVICE }} \
             --force-new-deployment \
@@ -111,6 +111,7 @@ jobs:
       - name: Wait for deployment
         if: github.event_name != 'pull_request' && inputs.skip_deploy != true
         run: |
+          aws ecs wait services-stable \
             --cluster ${{ env.ECS_CLUSTER }} \
             --services ${{ env.ECS_SERVICE }} \
             --region ${{ env.AWS_REGION }}
