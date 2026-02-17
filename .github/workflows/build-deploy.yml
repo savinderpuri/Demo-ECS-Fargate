@@ -32,7 +32,7 @@ env:
 jobs:
   build-and-deploy:
     name: Build, Push & Deploy
-    runs-on: self-hosted-f237e764
+    runs-on: self-hosted-d2707792
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
