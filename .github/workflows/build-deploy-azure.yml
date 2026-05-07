@@ -1,0 +1,195 @@
+name: Build and Deploy to Azure
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - '.github/workflows/**'
+      - 'pom.xml'
+      - 'src/**'
+      - 'Dockerfile'
+  pull_request:
+    branches: [main, master]
+    paths:
+      - '.github/workflows/**'
+      - 'pom.xml'
+      - 'src/**'
+      - 'Dockerfile'
+  workflow_dispatch:
+    inputs:
+      skip_deploy:
+        description: 'Skip Azure deployment'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  AZURE_RESOURCE_GROUP: efd-azure-test
+  AZURE_LOCATION: eastus
+  AZURE_CONTAINER_REGISTRY: demoecsfargateacr
+  ACR_LOGIN_SERVER: demoecsfargateacr.azurecr.io
+  CONTAINER_APP_ENVIRONMENT: demo-ecs-fargate-env
+  AZURE_CONTAINER_APP: demo-ecs-fargate-app
+  IMAGE_REPOSITORY: demo-ecs-fargate
+
+jobs:
+  build-and-deploy:
+    name: Build, Push & Deploy to Azure
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Set version
+        id: version
+        run: |
+          VERSION=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)
+          SHORT_SHA=${GITHUB_SHA::7}
+          echo "version=${VERSION}-${SHORT_SHA}" >> $GITHUB_OUTPUT
+          echo "Building version: ${VERSION}-${SHORT_SHA}"
+
+      - name: Build with Maven
+        run: mvn clean package -DskipTests
+
+      - name: Upload WAR artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: war-artifact
+          path: target/*.war
+          retention-days: 5
+
+      # Optional: Push to Nexus (only if NEXUS_URL is configured)
+      - name: Deploy to Nexus
+        if: vars.NEXUS_URL != ''
+        env:
+          NEXUS_URL: ${{ vars.NEXUS_URL }}
+          NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+        run: |
+          mvn deploy -DskipTests \
+            -DaltDeploymentRepository=nexus::default::${NEXUS_URL}/repository/maven-releases \
+            -s .github/maven-settings.xml
+
+      - name: Login to Azure
+        if: github.event_name != 'pull_request'
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Ensure Azure Container Apps extension
+        if: github.event_name != 'pull_request'
+        run: |
+          az extension add --name containerapp --upgrade
+
+      - name: Create Azure resources if missing
+        if: github.event_name != 'pull_request'
+        run: |
+          az group create \
+            --name ${{ env.AZURE_RESOURCE_GROUP }} \
+            --location ${{ env.AZURE_LOCATION }}
+
+          az acr show \
+            --name ${{ env.AZURE_CONTAINER_REGISTRY }} \
+            --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+          || az acr create \
+            --name ${{ env.AZURE_CONTAINER_REGISTRY }} \
+            --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+            --sku Basic \
+            --admin-enabled true
+          az acr update \
+            --name ${{ env.AZURE_CONTAINER_REGISTRY }} \
+            --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+            --admin-enabled true
+
+          az containerapp env show \
+            --name ${{ env.CONTAINER_APP_ENVIRONMENT }} \
+            --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+          || az containerapp env create \
+            --name ${{ env.CONTAINER_APP_ENVIRONMENT }} \
+            --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+            --location ${{ env.AZURE_LOCATION }}
+
+      - name: Login to Azure Container Registry
+        if: github.event_name != 'pull_request'
+        run: |
+          az acr login --name ${{ env.AZURE_CONTAINER_REGISTRY }}
+
+      - name: Build Docker image
+        if: github.event_name != 'pull_request'
+        run: |
+          IMAGE_TAG=${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_REPOSITORY }}:${{ steps.version.outputs.version }}
+          docker build \
+            --build-arg APP_VERSION=${{ steps.version.outputs.version }} \
+            -t ${IMAGE_TAG} \
+            -t ${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_REPOSITORY }}:latest \
+            .
+          echo "IMAGE_TAG=${IMAGE_TAG}" >> $GITHUB_ENV
+
+      - name: Push to Azure Container Registry
+        if: github.event_name != 'pull_request'
+        run: |
+          docker push ${{ env.IMAGE_TAG }}
+          docker push ${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_REPOSITORY }}:latest
+
+      - name: Create or update Azure Container App
+        if: github.event_name != 'pull_request' && inputs.skip_deploy != true
+        run: |
+          ACR_USERNAME=$(az acr credential show \
+            --name ${{ env.AZURE_CONTAINER_REGISTRY }} \
+            --query username \
+            --output tsv)
+          ACR_PASSWORD=$(az acr credential show \
+            --name ${{ env.AZURE_CONTAINER_REGISTRY }} \
+            --query passwords[0].value \
+            --output tsv)
+          echo "::add-mask::${ACR_PASSWORD}"
+
+          if az containerapp show \
+            --name ${{ env.AZURE_CONTAINER_APP }} \
+            --resource-group ${{ env.AZURE_RESOURCE_GROUP }}; then
+            az containerapp registry set \
+              --name ${{ env.AZURE_CONTAINER_APP }} \
+              --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+              --server ${{ env.ACR_LOGIN_SERVER }} \
+              --username "${ACR_USERNAME}" \
+              --password "${ACR_PASSWORD}"
+            az containerapp update \
+              --name ${{ env.AZURE_CONTAINER_APP }} \
+              --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+              --image ${{ env.IMAGE_TAG }}
+          else
+            az containerapp create \
+              --name ${{ env.AZURE_CONTAINER_APP }} \
+              --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+              --environment ${{ env.CONTAINER_APP_ENVIRONMENT }} \
+              --image ${{ env.IMAGE_TAG }} \
+              --target-port 8080 \
+              --ingress external \
+              --registry-server ${{ env.ACR_LOGIN_SERVER }} \
+              --registry-username "${ACR_USERNAME}" \
+              --registry-password "${ACR_PASSWORD}"
+          fi
+
+      - name: Get application URL
+        if: github.event_name != 'pull_request' && inputs.skip_deploy != true
+        run: |
+          APP_URL=$(az containerapp show \
+            --name ${{ env.AZURE_CONTAINER_APP }} \
+            --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+            --query properties.configuration.ingress.fqdn \
+            --output tsv)
+
+          echo ""
+          echo "================================================"
+          echo "Deployment Complete!"
+          echo "Application URL: https://${APP_URL}"
+          echo "Health Check:    https://${APP_URL}/api/health"
+          echo "API Info:        https://${APP_URL}/api/info"
+          echo "================================================"
